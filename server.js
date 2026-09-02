@@ -249,6 +249,16 @@ async function modoTeste(payload, insecure) {
   if (sock) {
     out.sni = "OK (" + target.host + ")";
     out.certClienteCarregado = hasCert;
+
+    // v1.2: sonda ociosa — espera 3s sem enviar nada.
+    // Se o servidor fechar sozinho, a rejeição é da conexão/certificado,
+    // não do conteúdo da requisição.
+    out.conexaoOciosa = await new Promise((resolve) => {
+      if (sock.destroyed) { resolve("ja fechada apos handshake"); return; }
+      const t = setTimeout(() => { resolve("aberta apos 3s (sem request)"); }, 3000);
+      sock.once("close", () => { clearTimeout(t); resolve("FECHOU sozinha apos handshake (sem qualquer request)"); });
+      sock.once("error", () => { clearTimeout(t); resolve("erro com socket ocioso"); });
+    });
     try {
       out.protocoloTls = sock.getProtocol();
       const c = sock.getCipher();
@@ -430,5 +440,5 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log("[RELAY] NFS-e relay Node v1.1 ouvindo na porta " + PORT);
+  console.log("[RELAY] NFS-e relay Node v1.2 ouvindo na porta " + PORT);
 });
