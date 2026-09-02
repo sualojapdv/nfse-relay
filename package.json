@@ -1,0 +1,12 @@
+{
+  "name": "nfse-relay",
+  "version": "1.0.0",
+  "description": "Relay SOAP NFS-e Uberlandia (porta 8003, TLS completo com SNI + certificado A1)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
