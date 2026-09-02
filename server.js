@@ -1,26 +1,25 @@
 /**
  * ============================================================
- * NFS-e SOAP RELAY (Node/Render) — Uberlândia/MG — porta 8003
+ * NFS-e SOAP RELAY (Node/Render) v1.1 — Uberlândia/MG — porta 8003
  * ============================================================
- * Por que este relay existe: o webservice da Prefeitura de Uberlândia
- * (https://nfsews.uberlandia.mg.gov.br:8003/nfse-ws/soap/nfse) exige
- * TLS completo (SNI + certificado A1) na porta 8003, que é bloqueada
- * por: hospedagem compartilhada (saída bloqueada), proxy Base44
- * (TLS só na 443) e Cloudflare Workers (starttls sem SNI/cert cliente).
- * Node.js faz o TLS completo com node:tls — SNI correto + cert A1.
+ * v1.1 (02/09/2026): modo teste em ESCADA de diagnóstico quando
+ * há certPem: (1) GET ?wsdl com cert de cliente, (2) POST neutro
+ * (sem dados fiscais) e (3) repetição com TLS 1.2 forçado se o
+ * servidor fechar a conexão sem resposta. Na EMISSÃO REAL: se o
+ * servidor fechar sem responder (0 bytes — sintoma visto em
+ * 02/09 20:10), tenta de novo com TLS 1.2 automaticamente.
  *
  * CONTRATO (idêntico ao relay Cloudflare — o NfseService.php não muda):
  *   POST JSON { webserviceUrl, soapXml, soapAction, certPem }
  *   → { "status":"ok", "httpCode":200, "response":"<soap...>" }
  *   erro: { "status":"erro_conexao"|"erro", "motivo":"[TLS] ...", "stage":"..." }
  *
- *   POST { "mode":"teste", "webserviceUrl":"https://...:8003/..." }
- *   → formato do diagnóstico (status, tcp, tls, sni, certClienteCarregado,
- *      protocoloTls, cipher, wsdl, httpCode)
+ *   POST { "mode":"teste", "webserviceUrl":"https://...:8003/...", "certPem": ... }
+ *   → { status, modo, host, port, tcp, tls, sni, certClienteCarregado,
+ *       protocoloTls, cipher, getHttpCode, getWsdl, postHttpCode, postBody, ... }
  *
  * SEGURANÇA: RELAY_TOKEN obrigatório (env) validado no header X-Relay-Token;
- * logs sanitizados (nunca registra PEM/token/XML completo);
- * anti-SSRF (só https + hostname público).
+ * logs sanitizados (nunca registra PEM/token/XML completo); anti-SSRF.
  */
 
 const http = require("http");
@@ -69,15 +68,23 @@ function splitPem(pem) {
   return { keys, certs };
 }
 
-/** Conecta com TLS completo: SNI + certificado de cliente (A1) */
-function tlsConnect(target, certPem, insecure) {
+/**
+ * Conecta com TLS completo: SNI + certificado de cliente (A1).
+ * forceTls12=true limita a TLS 1.2 (diagnóstico/fallback p/ servidores antigos).
+ */
+function tlsConnect(target, certPem, insecure, forceTls12) {
   return new Promise((resolve, reject) => {
     const opts = {
       host: target.host,
       port: target.port,
       servername: target.host, // SNI — essencial para a prefeitura
+      ALPNProtocols: ["http/1.1"],
       rejectUnauthorized: insecure !== "true" && insecure !== true,
     };
+    if (forceTls12) {
+      opts.minVersion = "TLSv1.2";
+      opts.maxVersion = "TLSv1.2";
+    }
     const { keys, certs } = splitPem(certPem);
     if (keys.length) opts.key = keys.join("\n");
     if (certs.length) opts.cert = certs.join("\n");
@@ -101,7 +108,10 @@ function tlsConnect(target, certPem, insecure) {
   });
 }
 
-/** Envia requisição HTTP sobre o socket TLS e devolve a resposta bruta */
+/**
+ * Envia requisição HTTP sobre o socket TLS e devolve { httpCode, headers, body, bytes }
+ * Resolve também quando o servidor fecha SEM responder (httpCode 0, body "")
+ */
 function httpOverTls(sock, target, { method, path, headers, body }) {
   return new Promise((resolve, reject) => {
     const bodyBuf = body ? Buffer.from(body, "utf8") : null;
@@ -122,8 +132,10 @@ function httpOverTls(sock, target, { method, path, headers, body }) {
     }, REQUEST_TIMEOUT_MS);
 
     const chunks = [];
+    let total = 0;
     sock.on("data", (c) => {
-      if (chunks.reduce((n, x) => n + x.length, 0) + c.length > MAX_BODY_BYTES) {
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
         clearTimeout(timer);
         sock.destroy();
         const e = new Error("resposta maior que 10MB");
@@ -135,7 +147,8 @@ function httpOverTls(sock, target, { method, path, headers, body }) {
     });
     sock.on("end", () => {
       clearTimeout(timer);
-      resolve(Buffer.concat(chunks));
+      const raw = Buffer.concat(chunks);
+      resolve(parseHttpResponse(raw));
     });
     sock.on("error", (err) => {
       clearTimeout(timer);
@@ -185,7 +198,12 @@ function parseHttpResponse(buf) {
   } else {
     body = text.slice(bodyStart);
   }
-  return { httpCode: m ? parseInt(m[1], 10) : 0, headers, body };
+  return { httpCode: m ? parseInt(m[1], 10) : 0, headers, body, bytes: buf.length };
+}
+
+function snippet(s, n) {
+  const t = String(s || "").replace(/[^\x09\x0a\x0d\x20-\x7e]/g, ".");
+  return t.substring(0, n || 160);
 }
 
 // ---------- modo teste (diagnóstico, sem emissão fiscal) ----------
@@ -208,46 +226,99 @@ async function modoTeste(payload, insecure) {
     s.on("error", () => { clearTimeout(t); out.tcp = "ERRO"; res(); });
   });
 
-  // TLS completo
-  try {
-    const sock = await tlsConnect(target, payload.certPem, insecure);
-    out.tls = "OK";
+  const hasCert = splitPem(payload.certPem || "").keys.length > 0;
+
+  // TLS completo (cert se disponível)
+  let sock = null;
+  for (const forceTls12 of [false, true]) {
+    try {
+      sock = await tlsConnect(target, payload.certPem, insecure, forceTls12);
+      out.tls = "OK" + (forceTls12 ? " (TLS 1.2 forçado)" : "");
+      out.tlsForcado = forceTls12;
+      break;
+    } catch (e) {
+      sock = null;
+      out.tls = "ERRO: " + String(e && e.message || e).slice(0, 250);
+      if (!forceTls12) continue; // tenta TLS 1.2 antes de desistir
+      out.motivo = "[TLS] " + String(e && e.message || e).slice(0, 250);
+      out.stage = "tls";
+      out.status = "erro_conexao";
+    }
+  }
+
+  if (sock) {
     out.sni = "OK (" + target.host + ")";
-    out.certClienteCarregado = splitPem(payload.certPem).keys.length > 0;
+    out.certClienteCarregado = hasCert;
     try {
       out.protocoloTls = sock.getProtocol();
       const c = sock.getCipher();
       out.cipher = c ? c.name : null;
     } catch (_) {}
 
-    // GET ?wsdl — só leitura
+    // 1) GET ?wsdl
     try {
-      const raw = await httpOverTls(sock, target, {
+      const g = await httpOverTls(sock, target, {
         method: "GET",
-        path: (target.path.replace(/\?.*$/, "")) + "?wsdl",
+        path: target.path.replace(/\?.*$/, "") + "?wsdl",
         headers: {
-          "User-Agent": "PDVMOVEL-NFSe-Relay/1.0",
+          "User-Agent": "PDVMOVEL-NFSe-Relay/1.1",
           "Accept": "text/xml, application/xml",
           "Accept-Encoding": "identity",
         },
       });
-      const { httpCode, body } = parseHttpResponse(raw);
-      out.httpCode = httpCode;
-      out.wsdl = /^\s*<\??xml|^\s*<wsdl|^\s*<definitions/i.test(body)
-        ? "OK (XML/WSDL retornado)"
-        : "NAO (" + body.slice(0, 100) + ")";
-      out.endpoint = "OK";
+      out.getHttpCode = g.httpCode;
+      out.getWsdl = /^\s*<\??xml|^\s*<wsdl|^\s*<definitions/i.test(g.body)
+        ? "SIM (WSDL retornado)"
+        : (g.httpCode === 0
+            ? "NAO — servidor fechou a conexao sem responder (0 bytes)"
+            : "NAO (" + snippet(g.body, 120) + ")");
     } catch (e) {
-      out.wsdl = "nao testado: " + String(e && e.message || e).slice(0, 150);
+      out.getWsdl = "ERRO: " + String(e && e.message || e).slice(0, 150);
     }
-  } catch (e) {
-    out.tls = "ERRO: " + String(e && e.message || e).slice(0, 250);
-    out.motivo = "[TLS] " + String(e && e.message || e).slice(0, 250);
-    out.stage = "tls";
-    out.status = "erro_conexao";
+
+    // 2) POST neutro (sem dados fiscais) — testa o caminho exato da emissão
+    try {
+      const p = await tlsConnect(target, payload.certPem, insecure, out.tlsForcado);
+      const r = await httpOverTls(p, target, {
+        method: "POST",
+        path: target.path.replace(/\?.*$/, ""),
+        headers: {
+          "Content-Type": "text/xml; charset=utf-8",
+          "User-Agent": "PDVMOVEL-NFSe-Relay/1.1",
+          "Accept": "text/xml, application/xml",
+          "Accept-Encoding": "identity",
+        },
+        body: "<conectividade xmlns=\"http://pdvmovel.relay/teste\"/>",
+      });
+      out.postHttpCode = r.httpCode;
+      out.postBody = r.httpCode === 0
+        ? "(servidor fechou a conexao sem responder — 0 bytes)"
+        : snippet(r.body, 200);
+    } catch (e) {
+      out.postBody = "ERRO: " + String(e && e.message || e).slice(0, 150);
+    }
   }
 
   return out;
+}
+
+// ---------- produção ----------
+
+async function sendSoap(target, payload, insecure, forceTls12) {
+  const sock = await tlsConnect(target, payload.certPem, insecure, forceTls12);
+  const r = await httpOverTls(sock, target, {
+    method: "POST",
+    path: target.path,
+    headers: {
+      "Content-Type": "text/xml; charset=utf-8",
+      SOAPAction: `"${payload.soapAction || ""}"`,
+      "User-Agent": "PDVMOVEL-NFSe-Relay/1.1",
+      "Accept": "text/xml, application/xml",
+      "Accept-Encoding": "identity",
+    },
+    body: payload.soapXml,
+  });
+  return r;
 }
 
 // ---------- servidor ----------
@@ -304,8 +375,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // modo teste OU produção
   try {
+    // modo teste OU produção
     if (payload.mode === "teste" || !payload.soapXml) {
       const out = await modoTeste(payload, process.env.NFSE_RELAY_INSECURE);
       res.writeHead(200);
@@ -321,23 +392,30 @@ const server = http.createServer(async (req, res) => {
 
     console.log("[RELAY] SOAP -> " + target.host + ":" + target.port + " | SOAPAction: " + (payload.soapAction || ""));
 
-    const sock = await tlsConnect(target, payload.certPem, process.env.NFSE_RELAY_INSECURE);
-    const raw = await httpOverTls(sock, target, {
-      method: "POST",
-      path: target.path,
-      headers: {
-        "Content-Type": "text/xml; charset=utf-8",
-        SOAPAction: `"${payload.soapAction || ""}"`,
-        "User-Agent": "PDVMOVEL-NFSe-Relay/1.0",
-        "Accept": "text/xml, application/xml",
-        "Accept-Encoding": "identity",
-      },
-      body: payload.soapXml,
-    });
-    const { httpCode, headers, body } = parseHttpResponse(raw);
-    console.log("[RELAY] HTTP " + httpCode + " | CT: " + (headers["content-type"] || "-") + " | " + body.length + " bytes");
+    let r = await sendSoap(target, payload, process.env.NFSE_RELAY_INSECURE, false);
+    let viaTls12 = false;
+
+    // v1.1: servidor fechou sem responder? tenta uma vez com TLS 1.2
+    if (r.httpCode === 0 && (r.body || "") === "") {
+      console.log("[RELAY] resposta vazia (0 bytes) — retry com TLS 1.2 forçado");
+      r = await sendSoap(target, payload, process.env.NFSE_RELAY_INSECURE, true);
+      viaTls12 = r.httpCode > 0 || (r.body || "") !== "";
+    }
+
+    if (r.httpCode === 0 && (r.body || "") === "") {
+      console.log("[RELAY] ERRO: servidor fechou a conexao sem resposta (mesmo com TLS 1.2)");
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        status: "erro_conexao",
+        motivo: "[soap] O servidor da prefeitura fechou a conexao sem responder (0 bytes), mesmo com TLS 1.2 forçado",
+        stage: "soap",
+      }));
+      return;
+    }
+
+    console.log("[RELAY] HTTP " + r.httpCode + " | CT: " + (r.headers["content-type"] || "-") + " | " + r.body.length + " bytes" + (viaTls12 ? " | via TLS 1.2" : ""));
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok", httpCode, response: body, responseLength: body.length }));
+    res.end(JSON.stringify({ status: "ok", httpCode: r.httpCode, response: r.body, responseLength: r.body.length }));
   } catch (e) {
     const msg = String(e && e.message || e).slice(0, 300);
     console.log("[RELAY] ERRO (" + (e.stage || "?") + "): " + msg);
@@ -352,5 +430,5 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log("[RELAY] NFS-e relay Node ouvindo na porta " + PORT);
+  console.log("[RELAY] NFS-e relay Node v1.1 ouvindo na porta " + PORT);
 });
