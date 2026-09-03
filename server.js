@@ -1,6 +1,6 @@
 /**
  * ============================================================
- * NFS-e SOAP RELAY (Node/Render) v1.1 — Uberlândia/MG — porta 8003
+ * NFS-e SOAP RELAY (Node/Render) v1.3 — Uberlândia/MG — porta 8003
  * ============================================================
  * v1.1 (02/09/2026): modo teste em ESCADA de diagnóstico quando
  * há certPem: (1) GET ?wsdl com cert de cliente, (2) POST neutro
@@ -112,7 +112,7 @@ function tlsConnect(target, certPem, insecure, forceTls12) {
  * Envia requisição HTTP sobre o socket TLS e devolve { httpCode, headers, body, bytes }
  * Resolve também quando o servidor fecha SEM responder (httpCode 0, body "")
  */
-function httpOverTls(sock, target, { method, path, headers, body }) {
+function httpOverTls(sock, target, { method, path, headers, body, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const bodyBuf = body ? Buffer.from(body, "utf8") : null;
     const head = [
@@ -126,7 +126,7 @@ function httpOverTls(sock, target, { method, path, headers, body }) {
 
     const timer = setTimeout(() => {
       sock.destroy();
-      const e = new Error(`timeout aguardando resposta (${REQUEST_TIMEOUT_MS}ms)`);
+      const e = new Error(`timeout aguardando resposta (${timeoutMs || REQUEST_TIMEOUT_MS}ms)`);
       e.stage = "soap";
       reject(e);
     }, REQUEST_TIMEOUT_MS);
@@ -228,6 +228,14 @@ async function modoTeste(payload, insecure) {
 
   const hasCert = splitPem(payload.certPem || "").keys.length > 0;
 
+  // v1.3: IP de saída do relay (best effort)
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    out.egressIp = (await (await fetch("https://api.ipify.org", { signal: ctrl.signal })).text()).trim();
+    clearTimeout(t);
+  } catch (_) {}
+
   // TLS completo (cert se disponível)
   let sock = null;
   for (const forceTls12 of [false, true]) {
@@ -314,11 +322,12 @@ async function modoTeste(payload, insecure) {
 
 // ---------- produção ----------
 
-async function sendSoap(target, payload, insecure, forceTls12) {
+async function sendSoap(target, payload, insecure, forceTls12, timeoutMs) {
   const sock = await tlsConnect(target, payload.certPem, insecure, forceTls12);
   const r = await httpOverTls(sock, target, {
     method: "POST",
     path: target.path,
+    timeoutMs: timeoutMs,
     headers: {
       "Content-Type": "text/xml; charset=utf-8",
       SOAPAction: `"${payload.soapAction || ""}"`,
@@ -402,30 +411,48 @@ const server = http.createServer(async (req, res) => {
 
     console.log("[RELAY] SOAP -> " + target.host + ":" + target.port + " | SOAPAction: " + (payload.soapAction || ""));
 
-    let r = await sendSoap(target, payload, process.env.NFSE_RELAY_INSECURE, false);
+    // v1.3: retry escalonado em caso de close silencioso (0 bytes).
+    // Cada tentativa abre uma NOVA conexão TCP/TLS — o pool NAT do Render pode
+    // sair por um IP diferente a cada conexão, contornando filtro de IP.
+    const MAX_TENTATIVAS = 4;
+    const TIMEOUTS = [25000, 12000, 12000, 12000]; // total ~65s < 70s do PHP
+    let r = null;
+    let tentativas = 0;
     let viaTls12 = false;
-
-    // v1.1: servidor fechou sem responder? tenta uma vez com TLS 1.2
-    if (r.httpCode === 0 && (r.body || "") === "") {
-      console.log("[RELAY] resposta vazia (0 bytes) — retry com TLS 1.2 forçado");
-      r = await sendSoap(target, payload, process.env.NFSE_RELAY_INSECURE, true);
-      viaTls12 = r.httpCode > 0 || (r.body || "") !== "";
+    for (let i = 0; i < MAX_TENTATIVAS; i++) {
+      viaTls12 = i >= 2; // tentativas 3 e 4 com TLS 1.2 forçado
+      r = await sendSoap(target, payload, process.env.NFSE_RELAY_INSECURE, viaTls12, TIMEOUTS[i]);
+      tentativas = i + 1;
+      if (r.httpCode > 0 || (r.body || "") !== "") break; // recebeu resposta
+      console.log("[RELAY] resposta vazia (0 bytes) na tentativa " + tentativas + "/" + MAX_TENTATIVAS);
+      if (i < MAX_TENTATIVAS - 1) await new Promise((ok) => setTimeout(ok, 700));
     }
 
+    // v1.3: IP de saída (best effort) — mostra qual IP a prefeitura enxergou
+    let egressIp = null;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 3000);
+      egressIp = (await (await fetch("https://api.ipify.org", { signal: ctrl.signal })).text()).trim();
+      clearTimeout(t);
+    } catch (_) {}
+
     if (r.httpCode === 0 && (r.body || "") === "") {
-      console.log("[RELAY] ERRO: servidor fechou a conexao sem resposta (mesmo com TLS 1.2)");
+      console.log("[RELAY] ERRO: servidor fechou sem responder em " + tentativas + "/" + MAX_TENTATIVAS + " tentativas" + (egressIp ? " | egress: " + egressIp : ""));
       res.writeHead(200);
       res.end(JSON.stringify({
         status: "erro_conexao",
-        motivo: "[soap] O servidor da prefeitura fechou a conexao sem responder (0 bytes), mesmo com TLS 1.2 forçado",
+        motivo: "[soap] O servidor da prefeitura fechou a conexao sem responder (0 bytes) em " + tentativas + " tentativas — provavel bloqueio/filtro de IP no firewall da prefeitura. Aguarde 30-60 min SEM testar e tente 1 vez. Se persistir, use um relay com IP fixo e peca a prefeitura para libera-lo.",
         stage: "soap",
+        tentativas: tentativas,
+        egressIp: egressIp,
       }));
       return;
     }
 
-    console.log("[RELAY] HTTP " + r.httpCode + " | CT: " + (r.headers["content-type"] || "-") + " | " + r.body.length + " bytes" + (viaTls12 ? " | via TLS 1.2" : ""));
+    console.log("[RELAY] HTTP " + r.httpCode + " | CT: " + (r.headers["content-type"] || "-") + " | " + r.body.length + " bytes" + (viaTls12 ? " | via TLS 1.2" : "") + (egressIp ? " | egress: " + egressIp : ""));
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok", httpCode: r.httpCode, response: r.body, responseLength: r.body.length }));
+    res.end(JSON.stringify({ status: "ok", httpCode: r.httpCode, response: r.body, responseLength: r.body.length, tentativas: tentativas, egressIp: egressIp }));
   } catch (e) {
     const msg = String(e && e.message || e).slice(0, 300);
     console.log("[RELAY] ERRO (" + (e.stage || "?") + "): " + msg);
